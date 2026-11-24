@@ -1,6 +1,24 @@
+# Build outputs
 .gradle/
 build/
+app/build/
+*.apk
+*.aab
+*.aar
+
+# Local config (contains machine-specific SDK path, no credentials)
 local.properties
+
+# IDE
 *.iml
 .idea/
-SmoothRec-debug.apk
+*.DS_Store
+
+# Kotlin daemon logs
+.kotlin/
+
+# Android Studio captures
+captures/
+
+# Gradle caches (generated)
+.gradle/

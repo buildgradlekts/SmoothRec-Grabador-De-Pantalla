@@ -2,6 +2,7 @@ package com.smoothrec.app.recording
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import com.smoothrec.app.R
 
 /** Opciones de resolución. Las dimensiones se derivan siempre de la relación de aspecto real. */
@@ -52,10 +53,55 @@ enum class AudioSourceOption(
     }
 }
 
+/** Canales que se solicitan a AudioRecord, al codificador AAC y al muxer. */
+enum class ChannelOption(
+    val key: String,
+    val labelRes: Int,
+    val channelCount: Int,
+) {
+    MONO("mono", R.string.channel_mono, 1),
+    STEREO("stereo", R.string.channel_stereo, 2),
+    ;
+
+    companion object {
+        fun fromKey(key: String?): ChannelOption =
+            values().firstOrNull { it.key == key } ?: STEREO
+    }
+}
+
+/**
+ * Qué contenido captura MediaProjection.
+ *
+ * En Android 14+ la captura de una sola app excluye limpiamente las ventanas
+ * de SmoothRec (barra flotante incluida). La captura de pantalla completa
+ * obliga a usar FLAG_SECURE y deja un rectángulo negro donde está la barra.
+ */
+enum class CaptureModeOption(
+    val key: String,
+    val labelRes: Int,
+) {
+    SINGLE_APP("single_app", R.string.capture_single_app),
+    FULL_SCREEN("full_screen", R.string.capture_full_screen),
+    ;
+
+    companion object {
+        fun default(): CaptureModeOption =
+            if (Build.VERSION.SDK_INT >= 34) SINGLE_APP else FULL_SCREEN
+
+        fun fromKey(key: String?): CaptureModeOption = when (key) {
+            SINGLE_APP.key -> SINGLE_APP
+            FULL_SCREEN.key -> FULL_SCREEN
+            else -> default()
+        }
+    }
+}
+
 data class RecordingSettings(
     val resolution: ResolutionOption = ResolutionOption.SCREEN,
     val fps: FpsOption = FpsOption.FPS_60,
     val audioSource: AudioSourceOption = AudioSourceOption.INTERNAL,
+    val channels: ChannelOption = ChannelOption.STEREO,
+    val captureMode: CaptureModeOption = CaptureModeOption.default(),
 )
 
 /** Persistencia sencilla sin dependencias: SharedPreferences privadas de la app. */
@@ -65,6 +111,8 @@ object RecordingPreferences {
     private const val KEY_RESOLUTION = "resolution"
     private const val KEY_FPS = "fps"
     private const val KEY_AUDIO_SOURCE = "audio_source"
+    private const val KEY_CHANNELS = "channels"
+    private const val KEY_CAPTURE_MODE = "capture_mode"
 
     fun load(context: Context): RecordingSettings {
         val prefs: SharedPreferences = context.applicationContext
@@ -73,6 +121,8 @@ object RecordingPreferences {
             resolution = ResolutionOption.fromKey(prefs.getString(KEY_RESOLUTION, null)),
             fps = FpsOption.fromValue(prefs.getInt(KEY_FPS, FpsOption.FPS_60.value)),
             audioSource = AudioSourceOption.fromKey(prefs.getString(KEY_AUDIO_SOURCE, null)),
+            channels = ChannelOption.fromKey(prefs.getString(KEY_CHANNELS, null)),
+            captureMode = CaptureModeOption.fromKey(prefs.getString(KEY_CAPTURE_MODE, null)),
         )
     }
 
@@ -83,6 +133,8 @@ object RecordingPreferences {
             .putString(KEY_RESOLUTION, settings.resolution.key)
             .putInt(KEY_FPS, settings.fps.value)
             .putString(KEY_AUDIO_SOURCE, settings.audioSource.key)
+            .putString(KEY_CHANNELS, settings.channels.key)
+            .putString(KEY_CAPTURE_MODE, settings.captureMode.key)
             .apply()
     }
 }

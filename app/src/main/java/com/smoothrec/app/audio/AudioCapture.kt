@@ -5,72 +5,327 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
+import android.media.AudioRecordingConfiguration
+import android.media.AudioTimestamp
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.os.Build
-import android.os.Process
 import android.util.Log
+import java.util.concurrent.Executor
+import java.util.concurrent.locks.LockSupport
 import com.smoothrec.app.R
 import com.smoothrec.app.recording.AudioSourceOption
+import com.smoothrec.app.recording.ChannelOption
 import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.sign
 import kotlin.math.tanh
 
-/** Formato PCM real seleccionado para la pista de audio. */
+/**
+ * Formato PCM de destino de la pista de audio.
+ *
+ * La máscara de entrada se usa para AudioRecord del micrófono y para calcular
+ * el búfer mínimo. La máscara de salida es la que usa AOSP para la captura de
+ * reproducción (AudioPlaybackCaptureConfiguration + AudioMix). Para estéreo
+ * ambas valen 0x0C, pero para mono no son iguales: CHANNEL_IN_MONO es 0x10 y
+ * CHANNEL_OUT_MONO es 0x04. Usar la máscara correcta evita que algunos
+ * dispositivos acepten el AudioRecord pero entreguen silencio.
+ */
 data class AudioFormatSpec(
     val sampleRate: Int,
-    val channelConfig: Int,
+    val channelCount: Int,
 ) {
-    val channelCount: Int
-        get() = if (channelConfig == AudioFormat.CHANNEL_IN_STEREO) 2 else 1
+    val inputChannelConfig: Int
+        get() = if (channelCount == 1) AudioFormat.CHANNEL_IN_MONO
+        else AudioFormat.CHANNEL_IN_STEREO
+
+    val outputChannelConfig: Int
+        get() = if (channelCount == 1) AudioFormat.CHANNEL_OUT_MONO
+        else AudioFormat.CHANNEL_OUT_STEREO
 
     val stereo: Boolean get() = channelCount == 2
 
-    fun buildAudioFormat(): AudioFormat = AudioFormat.Builder()
+    fun buildMicFormat(): AudioFormat = AudioFormat.Builder()
         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
         .setSampleRate(sampleRate)
-        .setChannelMask(channelConfig)
+        .setChannelMask(inputChannelConfig)
+        .build()
+
+    fun buildPlaybackCaptureFormat(): AudioFormat = AudioFormat.Builder()
+        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+        .setSampleRate(sampleRate)
+        .setChannelMask(outputChannelConfig)
         .build()
 }
 
+/** Correspondencia real entre el frame capturado y el reloj monotónico. */
+data class PcmClock(
+    val framePosition: Long,
+    val nanoTime: Long,
+    val sampleRate: Int,
+)
+
 interface PcmProvider {
-    /** Número de muestras (no bytes) escritas en el buffer. */
+    /** Número de muestras (no bytes) escritas en el buffer, ya en el formato destino. */
     fun read(buffer: ShortArray): Int
+
+    /** Relación frame/nanoTime de AudioRecord; null si el dispositivo no la expone. */
+    fun clock(): PcmClock? = null
 }
 
-/** Una fuente PCM: audio interno de otras apps o micrófono. */
+/**
+ * Una fuente PCM: audio interno de otras apps o micrófono.
+ *
+ * El número de canales que entrega AudioRecord puede no coincidir con el pedido
+ * (algunos dispositivos ignoran la máscara). Por eso se consulta el canal real
+ * y se convierte de forma explícita al formato destino antes de codificar.
+ */
 class PcmSource private constructor(
     private val record: AudioRecord,
     val spec: AudioFormatSpec,
+    sourceChannelCount: Int,
+    private val label: String,
+    val isInternal: Boolean,
 ) : PcmProvider {
 
+    private val sourceChannelCount: Int = sourceChannelCount.coerceAtLeast(1)
     private var started = false
+    private var callbackRegistered = false
+    private var conversionBuffer = ShortArray(0)
+    @Volatile private var readErrorLogged = false
+    @Volatile private var firstDataLogged = false
+    @Volatile private var firstSignalLogged = false
+    @Volatile private var clockLogged = false
+    private var silentChunks = 0
 
-    fun start() {
-        if (started) return
-        try {
+    val actualSampleRate: Int get() = record.sampleRate
+    val actualChannelCount: Int get() = sourceChannelCount
+
+    private val callbackExecutor = Executor { command -> command.run() }
+
+    // Se guarda como Any para no resolver AudioManager.AudioRecordingCallback
+    // (API 29) en dispositivos antiguos donde este código nunca se ejecuta.
+    private var recordingCallback: Any? = null
+
+    fun start(): Boolean {
+        if (started) return true
+        return try {
+            if (isInternal && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    val callback = object : AudioManager.AudioRecordingCallback() {
+                        override fun onRecordingConfigChanged(
+                            configs: MutableList<AudioRecordingConfiguration>,
+                        ) {
+                            for (config in configs) {
+                                Log.w(
+                                    TAG,
+                                    "$label cambio de configuración: " +
+                                        "silenciado=${config.isClientSilenced} " +
+                                        "fuente=${config.audioSource} " +
+                                        "rate=${config.format.sampleRate} " +
+                                        "canales=${config.format.channelCount} " +
+                                        "formato=${config.format}",
+                                )
+                                CaptureDiagnostics.log(
+                                    "$label config cambiada: silenciado=${config.isClientSilenced} " +
+                                        "fuente=${config.audioSource} canales=${config.format.channelCount}",
+                                )
+                            }
+                        }
+                    }
+                    recordingCallback = callback
+                    record.registerAudioRecordingCallback(callbackExecutor, callback)
+                    callbackRegistered = true
+                } catch (e: Exception) {
+                    Log.w(TAG, "$label no pudo registrar el callback de audio", e)
+                }
+            }
             record.startRecording()
-            started = true
+            started = record.recordingState == AudioRecord.RECORDSTATE_RECORDING
+            Log.i(
+                TAG,
+                "$label iniciado: estado=${record.state} grabando=${record.recordingState} " +
+                    "canales=$sourceChannelCount->${spec.channelCount} " +
+                    "rateReal=${record.sampleRate} rateDestino=${spec.sampleRate} " +
+                    "bufferFrames=${record.bufferSizeInFrames} fuente=${record.audioSource}",
+            )
+            CaptureDiagnostics.log(
+                "$label iniciado: grabando=$started canales=$sourceChannelCount->${spec.channelCount} " +
+                    "rateReal=${record.sampleRate} rateDestino=${spec.sampleRate} " +
+                    "bufferFrames=${record.bufferSizeInFrames}",
+            )
+            if (record.sampleRate != spec.sampleRate) {
+                Log.w(TAG, "$label: rate real ${record.sampleRate} != destino ${spec.sampleRate}")
+                CaptureDiagnostics.log(
+                    "$label AVISO: rate real ${record.sampleRate} != destino ${spec.sampleRate}; " +
+                        "los PTS usan el rate real",
+                )
+            }
+            if (!started) {
+                Log.w(TAG, "$label no quedó en estado RECORDING")
+                unregisterCallback()
+            } else {
+                logActiveConfiguration()
+            }
+            started
         } catch (e: IllegalStateException) {
-            Log.w(TAG, "No se pudo iniciar AudioRecord", e)
+            Log.w(TAG, "No se pudo iniciar $label", e)
+            unregisterCallback()
+            false
+        }
+    }
+
+    private fun logActiveConfiguration() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        try {
+            val active = record.activeRecordingConfiguration
+            if (active == null) {
+                CaptureDiagnostics.log("$label: activeRecordingConfiguration es null")
+                return
+            }
+            Log.i(
+                TAG,
+                "$label configuración activa: silenciado=${active.isClientSilenced} " +
+                    "fuente=${active.audioSource} rate=${active.format.sampleRate} " +
+                    "canales=${active.format.channelCount} formato=${active.format}",
+            )
+            CaptureDiagnostics.log(
+                "$label configuración activa: silenciado=${active.isClientSilenced} " +
+                    "fuente=${active.audioSource} canales=${active.format.channelCount}",
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "$label no pudo leer la configuración activa", e)
+            CaptureDiagnostics.log("$label: error al leer configuración activa: ${e.message}")
         }
     }
 
     override fun read(buffer: ShortArray): Int = readInto(buffer, 0, buffer.size)
 
-    fun readInto(buffer: ShortArray, offset: Int, length: Int): Int {
+    override fun clock(): PcmClock? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return null
+        return try {
+            val stamp = AudioTimestamp()
+            var base = AudioTimestamp.TIMEBASE_MONOTONIC
+            var ok = record.getTimestamp(stamp, base) == 0
+            if (!ok) {
+                base = AudioTimestamp.TIMEBASE_BOOTTIME
+                ok = record.getTimestamp(stamp, base) == 0
+            }
+            if (!ok) return null
+            // BOOTTIME incluye el sueño profundo; lo convertimos a la misma
+            // base monotónica que usa System.nanoTime() y el PTS del vídeo.
+            val nanoTime = if (base == AudioTimestamp.TIMEBASE_BOOTTIME) {
+                stamp.nanoTime + (System.nanoTime() - stamp.nanoTime)
+            } else {
+                stamp.nanoTime
+            }
+            if (!clockLogged) {
+                clockLogged = true
+                val baseName = if (base == AudioTimestamp.TIMEBASE_MONOTONIC) {
+                    "MONOTONIC"
+                } else {
+                    "BOOTTIME"
+                }
+                val message = "$label getTimestamp disponible ($baseName): " +
+                    "frame=${stamp.framePosition} nano=$nanoTime rate=${record.sampleRate}"
+                Log.i(TAG, message)
+                CaptureDiagnostics.log(message)
+            }
+            PcmClock(stamp.framePosition, nanoTime, record.sampleRate.coerceAtLeast(1))
+        } catch (e: Exception) {
+            if (!clockLogged) {
+                clockLogged = true
+                val message = "$label getTimestamp NO disponible: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+                Log.w(TAG, message)
+                CaptureDiagnostics.log(message)
+            }
+            null
+        }
+    }
+
+    /** Drena lo que haya disponible sin esperar; mantiene el búfer al día. */
+    fun readAvailable(buffer: ShortArray): Int = readIntoWithTimeout(buffer, 0, buffer.size, 0L)
+
+    fun readInto(buffer: ShortArray, offset: Int, length: Int): Int =
+        readIntoWithTimeout(buffer, offset, length, frameDurationNs(length))
+
+    private fun readIntoWithTimeout(
+        buffer: ShortArray,
+        offset: Int,
+        length: Int,
+        timeoutNs: Long,
+    ): Int {
         if (!started || length <= 0) return 0
-        // Un read() no bloqueante suele devolver solo unas pocas muestras. Si el
-        // codificador rellena el resto con ceros, el nivel cae decenas de dB y
-        // además avanza los PTS más rápido que el reloj real. Leemos hasta
-        // completar el frame, pero con un plazo máximo igual a su duración.
-        val deadline = System.nanoTime() +
-            length.toLong() * 1_000_000_000L / (spec.sampleRate * spec.channelCount)
+        val targetChannels = spec.channelCount
+        if (sourceChannelCount == targetChannels) {
+            return readRaw(buffer, offset, length, timeoutNs)
+        }
+
+        // Conversión explícita entre canales. Se calculan los frames destino y
+        // se leen exactamente las muestras de origen necesarias.
+        val frames = length / targetChannels
+        val sourceSamples = frames * sourceChannelCount
+        if (frames <= 0 || sourceSamples <= 0) return 0
+        if (conversionBuffer.size < sourceSamples) conversionBuffer = ShortArray(sourceSamples)
+        val temp = conversionBuffer
+        val read = readRaw(temp, 0, sourceSamples, timeoutNs)
+        if (read <= 0) return 0
+        val readFrames = read / sourceChannelCount
+
+        return when {
+            sourceChannelCount == 2 && targetChannels == 1 -> {
+                // Estéreo -> mono: media de ambos canales, sin desbordar.
+                for (i in 0 until readFrames) {
+                    val left = temp[2 * i].toInt()
+                    val right = temp[2 * i + 1].toInt()
+                    buffer[offset + i] = ((left + right) / 2).toShort()
+                }
+                readFrames
+            }
+            sourceChannelCount == 1 && targetChannels == 2 -> {
+                // Mono -> estéreo: el mismo sample en ambos canales.
+                for (i in 0 until readFrames) {
+                    val sample = temp[i]
+                    buffer[offset + 2 * i] = sample
+                    buffer[offset + 2 * i + 1] = sample
+                }
+                readFrames * 2
+            }
+            else -> {
+                // Canales inesperados (>2): se replica/recorta de forma segura.
+                for (i in 0 until readFrames) {
+                    for (c in 0 until targetChannels) {
+                        val sourceIndex = min(c, sourceChannelCount - 1)
+                        buffer[offset + i * targetChannels + c] =
+                            temp[i * sourceChannelCount + sourceIndex]
+                    }
+                }
+                readFrames * targetChannels
+            }
+        }
+    }
+
+    private fun frameDurationNs(targetSamples: Int): Long =
+        targetSamples.toLong() * 1_000_000_000L / (spec.sampleRate * spec.channelCount)
+
+    /**
+     * Lee hasta completar [length] muestras con un plazo máximo. Un read() no
+     * bloqueante devuelve muy pocas muestras; sin este bucle el nivel cae
+     * decenas de dB y los PTS avanzan sin reloj real.
+     */
+    private fun readRaw(
+        buffer: ShortArray,
+        offset: Int,
+        length: Int,
+        timeoutNs: Long,
+    ): Int {
+        val deadline = System.nanoTime() + timeoutNs
         var total = 0
         return try {
             while (total < length) {
@@ -82,15 +337,54 @@ class PcmSource private constructor(
                 )
                 if (count > 0) {
                     total += count
+                    if (!firstDataLogged) {
+                        firstDataLogged = true
+                        Log.i(TAG, "$label entrega datos PCM (primer read=$count muestras)")
+                        CaptureDiagnostics.log("$label primeros datos PCM: $count muestras")
+                    }
+                    checkFirstSignal(buffer, offset + total - count, count)
                     continue
                 }
+                if (count < 0 && !readErrorLogged) {
+                    readErrorLogged = true
+                    Log.w(TAG, "$label: AudioRecord.read devolvió error $count")
+                    CaptureDiagnostics.log("$label: AudioRecord.read devolvió error $count")
+                }
+                if (count == AudioRecord.ERROR_DEAD_OBJECT) break
                 val remaining = deadline - System.nanoTime()
                 if (remaining <= 0) break
-                Thread.sleep(1)
+                LockSupport.parkNanos(minOf(remaining, 1_000_000L))
             }
             total
         } catch (e: IllegalStateException) {
+            if (!readErrorLogged) {
+                readErrorLogged = true
+                Log.w(TAG, "$label: AudioRecord.read lanzó IllegalStateException", e)
+                CaptureDiagnostics.log("$label: AudioRecord.read lanzó IllegalStateException")
+            }
             0
+        }
+    }
+
+    /** Distingue "hay búfer" de "hay audio real": un búfer de ceros es silencio. */
+    private fun checkFirstSignal(buffer: ShortArray, offset: Int, count: Int) {
+        if (firstSignalLogged) return
+        var maxSample = 0
+        for (i in 0 until count) {
+            val value = abs(buffer[offset + i].toInt())
+            if (value > maxSample) maxSample = value
+        }
+        if (maxSample >= SIGNAL_THRESHOLD) {
+            firstSignalLogged = true
+            Log.i(TAG, "$label entrega señal real (pico=$maxSample)")
+            CaptureDiagnostics.log("$label SEÑAL REAL detectada (pico=$maxSample)")
+            return
+        }
+        silentChunks++
+        if (silentChunks == 50 || silentChunks == 200 || silentChunks == 600) {
+            CaptureDiagnostics.log(
+                "$label: $silentChunks bloques leídos sin señal (último pico=$maxSample, muestras=$count)",
+            )
         }
     }
 
@@ -100,49 +394,83 @@ class PcmSource private constructor(
         try {
             record.stop()
         } catch (e: IllegalStateException) {
-            Log.w(TAG, "AudioRecord ya estaba detenido", e)
+            Log.w(TAG, "$label ya estaba detenido", e)
         }
+        unregisterCallback()
     }
 
     fun release() {
         stop()
+        unregisterCallback()
         try {
             record.release()
         } catch (e: Exception) {
-            Log.w(TAG, "Error al liberar AudioRecord", e)
+            Log.w(TAG, "Error al liberar $label", e)
+        }
+    }
+
+    private fun unregisterCallback() {
+        if (!callbackRegistered) return
+        callbackRegistered = false
+        val callback = recordingCallback as? AudioManager.AudioRecordingCallback
+        recordingCallback = null
+        if (callback != null) {
+            try {
+                record.unregisterAudioRecordingCallback(callback)
+            } catch (e: Exception) {
+                Log.w(TAG, "$label no pudo desregistrar el callback de audio", e)
+            }
         }
     }
 
     companion object {
         private const val TAG = "PcmSource"
+        private const val SIGNAL_THRESHOLD = 8
 
         fun createInternal(projection: MediaProjection, spec: AudioFormatSpec): PcmSource? {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
             return try {
+                // Igual que AOSP: todas las reproducciones capturables, sin
+                // excluir UIDs. La app no reproduce audio propio durante la
+                // grabación, así que no hay realimentación.
                 val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                     .addMatchingUsage(AudioAttributes.USAGE_GAME)
                     .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .excludeUid(Process.myUid())
                     .build()
                 val minBuffer = AudioRecord.getMinBufferSize(
                     spec.sampleRate,
-                    spec.channelConfig,
+                    spec.inputChannelConfig,
                     AudioFormat.ENCODING_PCM_16BIT,
                 )
-                if (minBuffer <= 0) return null
+                if (minBuffer <= 0) {
+                    Log.w(TAG, "Audio interno: búfer mínimo inválido ($minBuffer)")
+                    return null
+                }
                 val record = AudioRecord.Builder()
                     .setAudioPlaybackCaptureConfig(captureConfig)
-                    .setAudioFormat(spec.buildAudioFormat())
+                    .setAudioFormat(spec.buildPlaybackCaptureFormat())
                     .setBufferSizeInBytes(minBuffer * 2)
                     .build()
                 if (record.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.w(TAG, "Audio interno no inicializado: estado=${record.state}")
                     record.release()
                     return null
                 }
-                PcmSource(record, spec)
+                Log.i(
+                    TAG,
+                    "Audio interno creado: canales=${record.channelCount} rate=${record.sampleRate} " +
+                        "máscara=0x${Integer.toHexString(spec.outputChannelConfig)} " +
+                        "búfer=${record.bufferSizeInFrames} frames",
+                )
+                CaptureDiagnostics.log(
+                    "Audio interno creado: canales=${record.channelCount} rate=${record.sampleRate} " +
+                        "máscara=0x${Integer.toHexString(spec.outputChannelConfig)}",
+                )
+                PcmSource(record, spec, record.channelCount, "audio interno", isInternal = true)
             } catch (e: Exception) {
                 Log.w(TAG, "Audio interno no disponible: $spec", e)
+                CaptureDiagnostics.log("Audio interno NO disponible: ${e.javaClass.simpleName}: ${e.message}")
                 null
             }
         }
@@ -151,20 +479,29 @@ class PcmSource private constructor(
             return try {
                 val minBuffer = AudioRecord.getMinBufferSize(
                     spec.sampleRate,
-                    spec.channelConfig,
+                    spec.inputChannelConfig,
                     AudioFormat.ENCODING_PCM_16BIT,
                 )
-                if (minBuffer <= 0) return null
+                if (minBuffer <= 0) {
+                    Log.w(TAG, "Micrófono: búfer mínimo inválido ($minBuffer)")
+                    return null
+                }
                 val record = AudioRecord.Builder()
                     .setAudioSource(MediaRecorder.AudioSource.MIC)
-                    .setAudioFormat(spec.buildAudioFormat())
+                    .setAudioFormat(spec.buildMicFormat())
                     .setBufferSizeInBytes(minBuffer * 2)
                     .build()
                 if (record.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.w(TAG, "Micrófono no inicializado: estado=${record.state}")
                     record.release()
                     return null
                 }
-                PcmSource(record, spec)
+                Log.i(
+                    TAG,
+                    "Micrófono creado: canales=${record.channelCount} rate=${record.sampleRate} " +
+                        "búfer=${record.bufferSizeInFrames} frames",
+                )
+                PcmSource(record, spec, record.channelCount, "micrófono", isInternal = false)
             } catch (e: Exception) {
                 Log.w(TAG, "Micrófono no disponible: $spec", e)
                 null
@@ -173,35 +510,50 @@ class PcmSource private constructor(
     }
 }
 
+/** Proveedor que empieza a entregar audio cuando las fuentes ya están creadas. */
+class DeferredPcmProvider : PcmProvider {
+    @Volatile private var delegate: PcmProvider? = null
+
+    fun setDelegate(provider: PcmProvider?) {
+        delegate = provider
+    }
+
+    override fun read(buffer: ShortArray): Int = delegate?.read(buffer) ?: 0
+
+    override fun clock(): PcmClock? = delegate?.clock()
+}
+
 /** Mezcla dos fuentes PCM con limitación suave para evitar saturación. */
 class AudioMixer(private val sources: List<PcmSource>) : PcmProvider {
+
+    private var left = ShortArray(0)
+    private var right = ShortArray(0)
 
     override fun read(buffer: ShortArray): Int {
         if (sources.size == 1) return sources[0].read(buffer)
         if (sources.size < 2) return 0
 
-        val left = ShortArray(buffer.size)
-        val right = ShortArray(buffer.size)
-        val leftCount = readFully(sources[0], left)
-        val rightCount = readFully(sources[1], right)
-        val count = min(leftCount, rightCount)
+        if (left.size != buffer.size) {
+            left = ShortArray(buffer.size)
+            right = ShortArray(buffer.size)
+        }
+        // Ambas fuentes se drenan sin bloquear con la misma duración de frame.
+        // Leer una en bloqueo hasta completarla podía esperar varios frames y
+        // desalinear la mezcla; aquí cada bloque se alinea por índice de muestra.
+        val leftCount = sources[0].readAvailable(left)
+        val rightCount = sources[1].readAvailable(right)
+        val count = minOf(buffer.size, maxOf(leftCount, rightCount))
 
         for (i in 0 until count) {
-            val mixed = left[i].toFloat() * MIX_GAIN + right[i].toFloat() * MIX_GAIN
-            buffer[i] = softLimit(mixed)
+            val l = if (i < leftCount) left[i].toFloat() else 0f
+            val r = if (i < rightCount) right[i].toFloat() else 0f
+            buffer[i] = softLimit(l * MIX_GAIN + r * MIX_GAIN)
         }
         return count
     }
 
-    private fun readFully(source: PcmSource, destination: ShortArray): Int {
-        var total = 0
-        while (total < destination.size) {
-            val read = source.readInto(destination, total, destination.size - total)
-            if (read <= 0) break
-            total += read
-        }
-        return total
-    }
+    override fun clock(): PcmClock? =
+        sources.asSequence().mapNotNull { it.clock() }.firstOrNull()
 
     private fun softLimit(value: Float): Short {
         val normalized = value / 32768f
@@ -220,58 +572,129 @@ class AudioMixer(private val sources: List<PcmSource>) : PcmProvider {
 }
 
 /**
- * Si la fuente elegida entrega silencio de forma sostenida, pasa a una fuente
- * alternativa real (normalmente el micrófono) en lugar de grabar un MP4 mudo.
- * El cambio es permanente durante la sesión para evitar alternancias.
+ * Usa la fuente principal (audio interno) cuando entrega señal y la alternativa
+ * (micrófono) cuando la principal está en silencio. La decisión se toma frame a
+ * frame y se mantienen ambas fuentes drenadas, de modo que:
+ *  - si el audio interno empieza a sonar más tarde, se usa en ese momento;
+ *  - si la app de origen no permite captura, el micrófono cubre el hueco;
+ *  - nunca se queda un MP4 mudo por un fallo puntual de la fuente principal.
+ *
+ * La lectura de la fuente principal es no bloqueante para no añadir latencia.
+ * La alternativa solo se lee en bloqueo cuando hace falta, con un plazo igual
+ * a la duración del frame, para que el reloj del encoder siga siendo real.
  */
 class SilenceFallbackProvider(
-    private val primary: PcmProvider,
-    private val fallback: PcmProvider?,
-    private val sampleRate: Int,
-    private val channelCount: Int,
+    private val primary: PcmSource,
+    private val fallback: PcmSource?,
     private val onFallback: () -> Unit,
 ) : PcmProvider {
 
-    @Volatile
-    private var usingFallback = false
-    private var silentFrames = 0
+    private var primaryBuffer = ShortArray(0)
+    private var fallbackBuffer = ShortArray(0)
+    @Volatile private var announced = false
+    private var usingPrimary = false
+    private var warmupFrames = 0
 
     override fun read(buffer: ShortArray): Int {
-        if (usingFallback) return fallback?.read(buffer) ?: 0
-        val count = primary.read(buffer)
-        val frames = if (count > 0) count / channelCount else buffer.size / channelCount
-        silentFrames = if (count > 0 && hasSignal(buffer, count)) 0 else silentFrames + frames
-        if (fallback != null && silentFrames >= sampleRate * SILENCE_SECONDS) {
-            usingFallback = true
-            silentFrames = 0
-            Log.w(TAG, "Fuente principal sin señal durante ${SILENCE_SECONDS}s: se usa la alternativa")
-            onFallback()
-            return fallback.read(buffer)
+        if (primaryBuffer.size != buffer.size) {
+            primaryBuffer = ShortArray(buffer.size)
+            fallbackBuffer = ShortArray(buffer.size)
         }
-        return count
+
+        // Al arrancar, AudioRecord tarda unos milisegundos en llenar su búfer.
+        // Sin esta espera el primer frame saldría del micrófono aunque el audio
+        // interno funcione. Solo se espera al principio, nunca en régimen normal.
+        val warmingUp = !usingPrimary && !announced && warmupFrames < WARMUP_FRAMES
+        if (warmingUp) warmupFrames++
+        val primaryCount = if (warmingUp) {
+            primary.readInto(primaryBuffer, 0, primaryBuffer.size)
+        } else {
+            primary.readAvailable(primaryBuffer)
+        }
+        if (primaryCount > 0 && hasSignal(primaryBuffer, primaryCount)) {
+            if (!usingPrimary) {
+                usingPrimary = true
+                Log.i(TAG, "Fuente principal con señal: se usa el audio interno")
+            }
+            // Se drena la alternativa sin bloquear para que no acumule audio viejo.
+            fallback?.readAvailable(fallbackBuffer)
+            System.arraycopy(primaryBuffer, 0, buffer, 0, primaryCount)
+            return primaryCount
+        }
+
+        val fallbackCount = fallback?.read(fallbackBuffer) ?: 0
+        if (fallbackCount > 0) {
+            if (!announced) {
+                announced = true
+                usingPrimary = false
+                Log.w(TAG, "Fuente principal sin señal: se usa la alternativa")
+                onFallback()
+            }
+            System.arraycopy(fallbackBuffer, 0, buffer, 0, fallbackCount)
+            return fallbackCount
+        }
+
+        // Sin datos de la alternativa: se devuelven los ceros de la principal
+        // para conservar el ritmo real del encoder (nunca se inventa audio).
+        if (primaryCount > 0) {
+            System.arraycopy(primaryBuffer, 0, buffer, 0, primaryCount)
+            return primaryCount
+        }
+        return 0
     }
 
+    override fun clock(): PcmClock? = primary.clock() ?: fallback?.clock()
+
+    /** Umbral bajo pero real: evita tratar dither de ±1 como señal útil. */
     private fun hasSignal(buffer: ShortArray, count: Int): Boolean {
         for (i in 0 until count) {
-            if (buffer[i].toInt() != 0) return true
+            if (abs(buffer[i].toInt()) >= SIGNAL_THRESHOLD) return true
         }
         return false
     }
 
     private companion object {
         const val TAG = "SilenceFallbackProvider"
-        const val SILENCE_SECONDS = 3
+        const val SIGNAL_THRESHOLD = 8
+        const val WARMUP_FRAMES = 3
     }
 }
 
-/** Fuente PCM lista para codificar. */
-data class AudioPlan(
-    val provider: PcmProvider,
+/** Fuente PCM lista para codificar. Las fuentes reales se crean tras el VirtualDisplay. */
+class AudioPlan(
+    val provider: DeferredPcmProvider,
     val spec: AudioFormatSpec,
+    val option: AudioSourceOption,
+    val initialNoticeRes: Int?,
+    private val starter: () -> AudioSourceStart,
+) {
+    private var sources: List<PcmSource> = emptyList()
+
+    /**
+     * Crea y arranca los AudioRecord. Debe llamarse después de crear el
+     * VirtualDisplay, igual que hace AOSP en su grabador de pantalla.
+     */
+    fun startSources(): AudioSourceStart {
+        val result = starter()
+        sources = result.sources
+        provider.setDelegate(result.provider)
+        return result
+    }
+
+    fun release() {
+        sources.forEach { it.release() }
+        sources = emptyList()
+        provider.setDelegate(null)
+    }
+}
+
+/** Resultado real de crear/arrancar las fuentes, con el aviso que corresponda. */
+data class AudioSourceStart(
+    val provider: PcmProvider?,
     val sources: List<PcmSource>,
     val noticeRes: Int? = null,
 ) {
-    fun release() = sources.forEach { it.release() }
+    val success: Boolean get() = provider != null
 }
 
 /** Resultado de la detección real: puede incluir un aviso para el usuario. */
@@ -284,40 +707,61 @@ data class AudioSetupResult(
 object AudioCaptureFactory {
 
     private const val TAG = "AudioCaptureFactory"
-    private val SAMPLE_RATES = intArrayOf(48_000, 44_100)
-    private val CHANNEL_CONFIGS = intArrayOf(
-        AudioFormat.CHANNEL_IN_STEREO,
-        AudioFormat.CHANNEL_IN_MONO,
-    )
+
+    /**
+     * AOSP usa 44100 Hz para la captura interna. Se prueba primero esa tasa
+     * porque es la más compatible con el AudioMix de reproducción; después
+     * 48000 Hz, que es la tasa nativa habitual del dispositivo.
+     */
+    private val INTERNAL_RATES = intArrayOf(44_100, 48_000)
+    private val MIC_RATES = intArrayOf(48_000, 44_100)
 
     fun create(
         context: Context,
         projection: MediaProjection,
         option: AudioSourceOption,
+        channelOption: ChannelOption,
         onFallback: () -> Unit = {},
     ): AudioSetupResult {
+        CaptureDiagnostics.reset()
+        CaptureDiagnostics.log("Nueva grabación: fuente=${option.key} canales=${channelOption.key}")
         if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
             return AudioSetupResult(null, R.string.audio_fallback_permission)
         }
 
-        for (rate in SAMPLE_RATES) {
-            for (channels in CHANNEL_CONFIGS) {
-                val spec = AudioFormatSpec(rate, channels)
-                if (!aacEncoderAvailable(spec)) continue
+        // 1) Se intenta exactamente el número de canales elegido por el usuario.
+        chooseSpec(option, channelOption)?.let { spec ->
+            val plan = buildPlan(projection, option, spec, onFallback, initialNoticeRes = null)
+            Log.i(
+                TAG,
+                "Audio ${option.key}: ${spec.sampleRate} Hz, " +
+                    "${spec.channelCount} canal(es) [${channelOption.key}]",
+            )
+            CaptureDiagnostics.log(
+                "Formato elegido: ${spec.sampleRate} Hz, ${spec.channelCount} canal(es)",
+            )
+            return AudioSetupResult(plan, null)
+        }
 
-                val plan = tryCreateSources(projection, option, spec, onFallback)
-                if (plan != null) {
-                    plan.sources.forEach { it.start() }
-                    Log.i(
-                        TAG,
-                        "Audio ${option.key}: $rate Hz, ${spec.channelCount} canales " +
-                            "(estéreo=${spec.stereo}), fuentes=${plan.sources.size}",
-                    )
-                    return AudioSetupResult(plan, plan.noticeRes)
-                }
-            }
+        // 2) Si el dispositivo no admite esa máscara, se prueba la contraria.
+        val alternative = if (channelOption == ChannelOption.STEREO) ChannelOption.MONO
+        else ChannelOption.STEREO
+        chooseSpec(option, alternative)?.let { spec ->
+            val plan = buildPlan(
+                projection,
+                option,
+                spec,
+                onFallback,
+                initialNoticeRes = R.string.audio_channels_fallback,
+            )
+            Log.w(
+                TAG,
+                "Canales ${channelOption.key} no disponibles: se usa ${alternative.key} " +
+                    "(${spec.channelCount} canal/es, ${spec.sampleRate} Hz)",
+            )
+            return AudioSetupResult(plan, plan.initialNoticeRes)
         }
 
         val notice = when (option) {
@@ -328,60 +772,119 @@ object AudioCaptureFactory {
         return AudioSetupResult(null, notice)
     }
 
-    private fun tryCreateSources(
+    /**
+     * Comprueba el formato sin crear todavía el AudioRecord: así la creación
+     * real puede hacerse después del VirtualDisplay sin arriesgar la pista AAC.
+     */
+    private fun chooseSpec(
+        option: AudioSourceOption,
+        channelOption: ChannelOption,
+    ): AudioFormatSpec? {
+        val rates = if (option == AudioSourceOption.MIC) MIC_RATES else INTERNAL_RATES
+        for (rate in rates) {
+            val spec = AudioFormatSpec(rate, channelOption.channelCount)
+            if (AudioRecord.getMinBufferSize(
+                    rate,
+                    spec.inputChannelConfig,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                ) <= 0
+            ) {
+                continue
+            }
+            if (!aacEncoderAvailable(spec)) continue
+            return spec
+        }
+        return null
+    }
+
+    private fun buildPlan(
         projection: MediaProjection,
         option: AudioSourceOption,
         spec: AudioFormatSpec,
         onFallback: () -> Unit,
-    ): AudioPlan? {
-        val sources = mutableListOf<PcmSource>()
-        fun releaseAll() {
-            sources.forEach { it.release() }
-            sources.clear()
+        initialNoticeRes: Int?,
+    ): AudioPlan {
+        val provider = DeferredPcmProvider()
+        return AudioPlan(provider, spec, option, initialNoticeRes) {
+            startSources(projection, option, spec, onFallback)
         }
+    }
 
+    /**
+     * Crea las fuentes reales. Se llama justo después de createVirtualDisplay:
+     * AOSP también crea su AudioRecord interno en ese momento. El micrófono solo
+     * se abre en los modos MIC y MIXED; en INTERNAL nunca se usa como respaldo.
+     */
+    private fun startSources(
+        projection: MediaProjection,
+        option: AudioSourceOption,
+        spec: AudioFormatSpec,
+        onFallback: () -> Unit,
+    ): AudioSourceStart {
         when (option) {
             AudioSourceOption.INTERNAL -> {
-                val internal = PcmSource.createInternal(projection, spec) ?: return null
-                sources.add(internal)
-                // La captura de reproducción depende de que la app de origen
-                // permita ser grabada. Si no entrega señal, el micrófono evita
-                // que la pista AAC quede compuesta solo por silencio.
-                val mic = PcmSource.createMic(spec)
-                if (mic != null) sources.add(mic)
-                val provider = if (mic != null) {
-                    SilenceFallbackProvider(
-                        internal,
-                        mic,
-                        spec.sampleRate,
-                        spec.channelCount,
-                        onFallback,
-                    )
-                } else {
-                    internal
+                // El modo "Audio interno" NO debe abrir el micrófono: hacerlo
+                // hace que el usuario crea que se capturó el audio del teléfono
+                // cuando en realidad está oyendo el micrófono. Si la captura de
+                // reproducción falla, se avisa y la grabación queda sin audio.
+                val internal = PcmSource.createInternal(projection, spec)
+                if (internal == null || !internal.start()) {
+                    internal?.release()
+                    Log.e(TAG, "Audio interno no disponible: no se usará el micrófono")
+                    CaptureDiagnostics.log("RESULTADO: audio interno NO arrancó. Sin micrófono.")
+                    return AudioSourceStart(null, emptyList(), R.string.audio_fallback_internal)
                 }
-                return AudioPlan(provider, spec, sources.toList())
+                CaptureDiagnostics.log("RESULTADO: solo audio interno (sin micrófono)")
+                return AudioSourceStart(internal, listOf(internal))
             }
+
             AudioSourceOption.MIC -> {
-                val mic = PcmSource.createMic(spec) ?: return null
-                sources.add(mic)
+                val mic = PcmSource.createMic(spec)
+                if (mic == null || !mic.start()) {
+                    mic?.release()
+                    Log.e(TAG, "No se pudo arrancar el micrófono")
+                    CaptureDiagnostics.log("RESULTADO: micrófono NO arrancó")
+                    return AudioSourceStart(null, emptyList(), R.string.audio_fallback_mic)
+                }
+                CaptureDiagnostics.log("RESULTADO: solo micrófono")
+                return AudioSourceStart(mic, listOf(mic))
             }
+
             AudioSourceOption.MIXED -> {
                 val internal = PcmSource.createInternal(projection, spec)
                 val mic = PcmSource.createMic(spec)
-                if (internal != null) sources.add(internal)
-                if (mic != null) sources.add(mic)
-                if (sources.isEmpty()) return null
-                if (sources.size == 1) {
-                    val notice = if (mic != null) R.string.audio_fallback_mixed_mic
-                    else R.string.audio_fallback_mixed_internal
-                    return AudioPlan(sources[0], spec, sources.toList(), notice)
+                val started = mutableListOf<PcmSource>()
+
+                if (internal != null) {
+                    if (internal.start()) started.add(internal) else internal.release()
                 }
+                if (mic != null) {
+                    if (mic.start()) started.add(mic) else mic.release()
+                }
+
+                if (started.isEmpty()) {
+                    Log.e(TAG, "No se pudo arrancar ninguna fuente para la mezcla")
+                    CaptureDiagnostics.log("RESULTADO: mezcla sin fuentes")
+                    return AudioSourceStart(null, emptyList(), R.string.audio_fallback_mixed)
+                }
+                val sourceNames = started.joinToString { source ->
+                    if (source.isInternal) "interno" else "micrófono"
+                }
+                CaptureDiagnostics.log("RESULTADO: mezcla con $sourceNames")
+                val provider: PcmProvider = if (started.size == 1) {
+                    started[0]
+                } else {
+                    AudioMixer(started.toList())
+                }
+                val notice = if (started.size == 1) {
+                    if (started[0].isInternal) R.string.audio_fallback_mixed_internal
+                    else R.string.audio_fallback_mixed_mic
+                } else {
+                    null
+                }
+                return AudioSourceStart(provider, started.toList(), notice)
             }
         }
-
-        val provider: PcmProvider = if (sources.size == 1) sources[0] else AudioMixer(sources)
-        return AudioPlan(provider, spec, sources.toList())
     }
 
     private fun aacEncoderAvailable(spec: AudioFormatSpec): Boolean {

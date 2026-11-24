@@ -7,15 +7,21 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import android.os.Bundle
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
+import com.smoothrec.app.audio.CaptureDiagnostics
 import com.smoothrec.app.capture.CaptureNotification
 import com.smoothrec.app.capture.ScreenCaptureService
 import com.smoothrec.app.recording.RecordingPreferences
+import com.smoothrec.app.updater.UpdateManager
+import java.util.UUID
 
 /**
  * Interfaz de grabación minimalista.
@@ -25,7 +31,7 @@ import com.smoothrec.app.recording.RecordingPreferences
  */
 class MainActivity : Activity() {
 
-    private enum class UiState { READY, REQUESTING, RECORDING, STOPPED }
+    private enum class UiState { READY, REQUESTING, SESSION, RECORDING, STOPPED }
 
     private lateinit var stateLabel: TextView
     private lateinit var stateHint: TextView
@@ -34,10 +40,12 @@ class MainActivity : Activity() {
     private lateinit var currentSettingsValue: TextView
 
     private var uiState: UiState = UiState.READY
+    private var currentSessionId: String? = null
 
     private val stoppedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            applyState(UiState.STOPPED)
+            val active = intent.getBooleanExtra(CaptureNotification.EXTRA_SESSION_ACTIVE, false)
+            applyState(if (active) UiState.SESSION else UiState.STOPPED)
         }
     }
 
@@ -68,6 +76,7 @@ class MainActivity : Activity() {
         settingsButton.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
+        UpdateManager.checkIfNeeded(this)
         applyState(uiState)
     }
 
@@ -109,8 +118,13 @@ class MainActivity : Activity() {
 
     private fun onRecordButtonClicked() {
         when (uiState) {
-            UiState.RECORDING -> {
-                stopService(Intent(this, ScreenCaptureService::class.java))
+            UiState.SESSION, UiState.RECORDING -> {
+                // Cierra la sesión completa (barra + MediaProjection), no solo el MP4.
+                startService(
+                    Intent(this, ScreenCaptureService::class.java).apply {
+                        action = CaptureNotification.ACTION_END_SESSION
+                    },
+                )
                 applyState(UiState.STOPPED)
             }
             UiState.REQUESTING -> Unit
@@ -137,7 +151,19 @@ class MainActivity : Activity() {
             requestPermissions(needed.toTypedArray(), REQUEST_PERMISSIONS)
             return
         }
-        launchProjectionConsent()
+        if (ensureOverlayPermission()) launchProjectionConsent()
+    }
+
+    /** Sin superposición no se podría controlar la grabación desde otras apps. */
+    private fun ensureOverlayPermission(): Boolean {
+        if (Settings.canDrawOverlays(this)) return true
+        Toast.makeText(this, R.string.overlay_permission_hint, Toast.LENGTH_LONG).show()
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName"),
+        )
+        startActivity(intent)
+        return false
     }
 
     override fun onRequestPermissionsResult(
@@ -147,11 +173,33 @@ class MainActivity : Activity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != REQUEST_PERMISSIONS) return
-        launchProjectionConsent()
+
+        val audioGranted = grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+        if (!audioGranted) {
+            CaptureDiagnostics.log("Permisos: RECORD_AUDIO DENEGADO por el usuario")
+            Toast.makeText(this, R.string.audio_permission_denied, Toast.LENGTH_LONG).show()
+            applyState(UiState.STOPPED)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(this, R.string.notification_permission_denied, Toast.LENGTH_LONG).show()
+        }
+        CaptureDiagnostics.log("Permisos: RECORD_AUDIO CONCEDIDO")
+        if (ensureOverlayPermission()) launchProjectionConsent()
     }
 
     private fun launchProjectionConsent() {
         applyState(UiState.REQUESTING)
+        CaptureDiagnostics.reset()
+        CaptureDiagnostics.logPermissions(this)
+        // Se genera un identificador nuevo para cada consentimiento. El servicio
+        // lo consume una sola vez, así un intent antiguo no puede reutilizar un
+        // token de MediaProjection de una sesión anterior.
+        currentSessionId = UUID.randomUUID().toString()
         val manager = getSystemService(MediaProjectionManager::class.java)
         @Suppress("DEPRECATION")
         startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_MEDIA_PROJECTION)
@@ -162,14 +210,18 @@ class MainActivity : Activity() {
         if (requestCode != REQUEST_MEDIA_PROJECTION) return
 
         if (resultCode != RESULT_OK || data == null) {
+            CaptureDiagnostics.log("MediaProjection: consentimiento DENEGADO o sin datos")
             applyState(UiState.STOPPED)
             return
         }
 
-        applyState(UiState.RECORDING)
+        CaptureDiagnostics.log("MediaProjection: consentimiento ACEPTADO")
+        applyState(UiState.SESSION)
         val serviceIntent = Intent(this, ScreenCaptureService::class.java).apply {
+            action = ScreenCaptureService.ACTION_START
             putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
             putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, data)
+            putExtra(ScreenCaptureService.EXTRA_SESSION_ID, currentSessionId)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(serviceIntent)
@@ -204,6 +256,14 @@ class MainActivity : Activity() {
                 backgroundRes = R.drawable.fab_background
                 descriptionRes = R.string.record_start_description
                 colorRes = R.color.accent_end
+            }
+            UiState.SESSION -> {
+                labelRes = R.string.state_session
+                hintRes = R.string.hint_session
+                iconRes = R.drawable.ic_stop
+                backgroundRes = R.drawable.fab_background_stop
+                descriptionRes = R.string.record_stop_description
+                colorRes = R.color.recording_accent
             }
             UiState.RECORDING -> {
                 labelRes = R.string.state_recording

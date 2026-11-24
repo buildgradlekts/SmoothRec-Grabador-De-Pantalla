@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/overlayRoot"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:background="@drawable/overlay_bar_background"
+    android:elevation="10dp"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="4dp"
+    android:paddingTop="3dp"
+    android:paddingEnd="4dp"
+    android:paddingBottom="3dp">
+
+    <ImageButton
+        android:id="@+id/overlayRecord"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:background="@drawable/overlay_button_background"
+        android:contentDescription="@string/overlay_start"
+        android:padding="10dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_record"
+        android:tint="@color/recording_accent" />
+
+    <TextView
+        android:id="@+id/overlayTimer"
+        android:layout_width="80dp"
+        android:layout_height="40dp"
+        android:fontFamily="monospace"
+        android:gravity="center"
+        android:includeFontPadding="false"
+        android:letterSpacing="0.04"
+        android:text="00:00:00"
+        android:textColor="@android:color/white"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <ImageButton
+        android:id="@+id/overlayStop"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:background="@drawable/overlay_button_background"
+        android:contentDescription="@string/overlay_stop"
+        android:padding="10dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_stop"
+        android:tint="@android:color/white" />
+
+    <View
+        android:layout_width="1dp"
+        android:layout_height="22dp"
+        android:layout_marginStart="2dp"
+        android:layout_marginEnd="2dp"
+        android:background="#33FFFFFF" />
+
+    <ImageButton
+        android:id="@+id/overlayFolder"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:background="@drawable/overlay_button_background"
+        android:contentDescription="@string/overlay_folder"
+        android:padding="8dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_overlay_folder"
+        android:tint="#FFD6D6DE" />
+
+    <ImageButton
+        android:id="@+id/overlaySettings"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:background="@drawable/overlay_button_background"
+        android:contentDescription="@string/overlay_settings"
+        android:padding="8dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_settings"
+        android:tint="#FFD6D6DE" />
+
+    <ImageButton
+        android:id="@+id/overlayClose"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:background="@drawable/overlay_button_background"
+        android:contentDescription="@string/overlay_close"
+        android:padding="9dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_overlay_close"
+        android:tint="#FFD6D6DE" />
+
+</LinearLayout>

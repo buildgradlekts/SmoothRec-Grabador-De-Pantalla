@@ -20,7 +20,9 @@ interface EncoderOutput {
 interface VideoEncoder {
     fun start(config: EncoderConfig, output: EncoderOutput)
     fun inputSurface(): Surface
-    /** Señala el fin del stream y espera el drenado de los buffers pendientes. */
+    /** Señala el fin del stream sin esperar, para drenar audio y vídeo a la vez. */
+    fun signalEndOfStream()
+    /** Espera el drenado de los buffers pendientes. */
     fun stop()
     fun release()
 }

@@ -5,11 +5,13 @@
     <string name="state_ready">Listo</string>
     <string name="state_requesting">Solicitando permisos</string>
     <string name="state_recording">Grabando</string>
+    <string name="state_session">Sesión activa</string>
     <string name="state_stopped">Detenido</string>
 
     <string name="hint_ready">Pulsa el botón para empezar</string>
     <string name="hint_requesting">Permite la captura para continuar</string>
     <string name="hint_recording">Pulsa para detener</string>
+    <string name="hint_session">Usa la barra flotante para grabar desde otras apps</string>
     <string name="hint_stopped">La sesión se ha detenido</string>
 
     <string name="current_settings">CONFIGURACIÓN ACTUAL</string>
@@ -47,18 +49,29 @@
     <string name="audio_internal">Audio interno</string>
     <string name="audio_mic">Micrófono</string>
     <string name="audio_mixed">Interno + micrófono</string>
-    <string name="settings_channels">Configuración automática de canales</string>
-    <string name="settings_channels_value">Estéreo si es compatible, de lo contrario mono</string>
+    <string name="settings_capture_mode">Modo de captura</string>
+    <string name="capture_single_app">Una app</string>
+    <string name="capture_full_screen">Pantalla completa</string>
+    <string name="settings_capture_mode_hint">En Android 14+ elige «Una app» al aceptar la captura y selecciona el juego. Así la barra flotante no aparece en el vídeo ni deja un rectángulo negro. En «Pantalla completa» la barra queda oculta con un recuadro negro.</string>
+    <string name="capture_single_app_toast">En el diálogo elige «Una app» y selecciona el juego que quieres grabar.</string>
+    <string name="settings_channels">Canales de audio</string>
+    <string name="channel_mono">MONO</string>
+    <string name="channel_stereo">ESTÉREO</string>
 
     <string name="audio_fallback_permission">Sin permiso de micrófono: la grabación será solo vídeo.</string>
     <string name="audio_fallback_internal">Audio interno no disponible: la grabación será solo vídeo.</string>
+    <string name="audio_fallback_internal_mic">Audio interno no disponible: se usa el micrófono.</string>
     <string name="audio_fallback_mic">Micrófono no disponible: la grabación será solo vídeo.</string>
     <string name="audio_fallback_mixed">No se pudieron capturar las fuentes de audio: la grabación será solo vídeo.</string>
     <string name="audio_fallback_mixed_mic">Audio interno no disponible: se usa solo el micrófono.</string>
     <string name="audio_fallback_mixed_internal">Micrófono no disponible: se usa solo el audio interno.</string>
     <string name="audio_fallback_encoder">No se pudo iniciar el codificador de audio: la grabación será solo vídeo.</string>
     <string name="audio_fallback_silent">La fuente de audio seleccionada no entrega señal. Comprueba la app de origen o elige otro modo en Ajustes.</string>
-    <string name="audio_internal_fallback">El audio interno no entregó señal: se usa el micrófono para no grabar silencio.</string>
+    <string name="audio_internal_silent">Audio interno sin señal: la app de origen no permite capturarlo o no estaba reproduciendo sonido. No se ha usado el micrófono. Revisa SmoothRec-diagnostico.txt en Descargas.</string>
+    <string name="audio_permission_denied">Permiso de micrófono denegado: no se puede iniciar la grabación.</string>
+    <string name="notification_permission_denied">Notificaciones denegadas: la grabación continuará, pero es posible que la notificación no se vea.</string>
+    <string name="audio_internal_fallback">El audio interno no entrega señal en este momento: se usa el micrófono cuando hace falta.</string>
+    <string name="audio_channels_fallback">El dispositivo no admite los canales elegidos: se ajusta automáticamente.</string>
 
     <string name="fallback_resolution">Combinación no compatible con el encoder: se graba a %1$d×%2$d a %3$d FPS.</string>
     <string name="fallback_framerate">El encoder no admite la tasa elegida en esta resolución: se usan %1$d FPS.</string>
@@ -68,7 +81,10 @@
     <string name="notification_title">SmoothRec</string>
     <string name="notification_text">Grabando vídeo · 1080p · 60 FPS</string>
     <string name="notification_text_dynamic">Grabando vídeo · %1$d×%2$d · %3$d FPS</string>
-    <string name="notification_stop_action">Detener</string>
+    <string name="notification_stop_action">Detener grabación</string>
+    <string name="notification_close_action">Cerrar sesión</string>
+    <string name="notification_session_text">Sesión activa · usa la barra flotante para grabar</string>
+    <string name="notification_recording_time">Grabando · %1$s</string>
 
     <string name="about_title">Acerca de SmoothRec</string>
     <string name="about_creator">Creador y responsable del proyecto: Keiner</string>
@@ -79,4 +95,27 @@
     <string name="about_instagram">Instagram · próximamente</string>
     <string name="about_tiktok_description">Abrir perfil de TikTok</string>
     <string name="about_no_browser">No hay una aplicación disponible para abrir el enlace.</string>
+
+    <string name="update_check">Buscar actualizaciones</string>
+    <string name="update_checking">Comprobando…</string>
+    <string name="update_none">No hay versiones publicadas todavía.</string>
+    <string name="update_current">Ya tienes la última versión.</string>
+    <string name="update_error">No se pudo comprobar la actualización.</string>
+    <string name="update_found">Versión %1$s disponible:\n%2$s</string>
+    <string name="update_title">Actualización de SmoothRec %1$s</string>
+    <string name="update_tap">Toca para descargar e instalar</string>
+    <string name="update_channel">Actualizaciones de SmoothRec</string>
+    <string name="update_downloading">Descargando actualización…</string>
+    <string name="update_allow_install">Permite instalar aplicaciones desconocidas desde SmoothRec para continuar.</string>
+
+    <string name="overlay_start">Iniciar grabación desde la barra flotante</string>
+    <string name="overlay_stop">Detener grabación desde la barra flotante</string>
+    <string name="overlay_folder">Abrir carpeta de grabaciones</string>
+    <string name="overlay_settings">Abrir ajustes</string>
+    <string name="overlay_close">Ocultar barra flotante</string>
+    <string name="overlay_permission">Activar barra flotante</string>
+    <string name="overlay_permission_hint">Necesaria para ver la barra sobre juegos y otras apps.</string>
+    <string name="overlay_permission_granted">La barra flotante ya está activada.</string>
+    <string name="overlay_notification_title">SmoothRec · sesión activa</string>
+    <string name="overlay_notification_text">Barra flotante y grabación listas</string>
 </resources>

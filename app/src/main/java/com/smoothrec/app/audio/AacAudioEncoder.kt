@@ -1,5 +1,6 @@
 package com.smoothrec.app.audio
 
+import android.media.AudioFormat
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -26,6 +27,7 @@ class AacAudioEncoder(
     private val formatLatch = CountDownLatch(1)
     private val finishedLatch = CountDownLatch(1)
     private val stopping = AtomicBoolean(false)
+    private val formatReady = AtomicBoolean(false)
     @Volatile
     private var forwarding = false
     private var codec: MediaCodec? = null
@@ -40,6 +42,9 @@ class AacAudioEncoder(
             spec.channelCount,
         ).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, if (spec.stereo) 96_000 else 64_000)
+            setInteger(MediaFormat.KEY_CHANNEL_COUNT, spec.channelCount)
+            setInteger(MediaFormat.KEY_SAMPLE_RATE, spec.sampleRate)
+            setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
             setInteger(
                 MediaFormat.KEY_AAC_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AACObjectLC,
@@ -84,11 +89,23 @@ class AacAudioEncoder(
     private fun pump(mediaCodec: MediaCodec) {
         val frameSamples = 1024
         val pcm = ShortArray(frameSamples * spec.channelCount)
-        var ptsUs = 0L
         val info = MediaCodec.BufferInfo()
-        val frameNs = frameSamples * 1_000_000_000L / spec.sampleRate
-        var nextInputNs = 0L
-        val silenceFramesToDetect = spec.sampleRate / frameSamples * 2
+
+        // Reloj común con el vídeo: el PTS se deriva del instante real en que
+        // AudioRecord capturó cada frame, no de un contador local reiniciado en 0.
+        var rateHz = spec.sampleRate.coerceAtLeast(1)
+        var framesQueued = 0L
+        var anchorFrame = 0L
+        var anchorNs = 0L
+        var anchored = false
+        var lastQueuedPtsUs = 0L
+        var firstInputPtsUs = -1L
+        var lastInputPtsUs = -1L
+        var firstOutputPtsUs = -1L
+        var lastOutputPtsUs = -1L
+        var clockLogged = false
+        var capacityLogged = false
+        var silenceFramesToDetect = rateHz / frameSamples * 2
         var silentFrames = 0
         var silenceReported = false
 
@@ -105,6 +122,14 @@ class AacAudioEncoder(
             if (forwarding && info.size > 0 &&
                 info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0
             ) {
+                if (firstOutputPtsUs < 0) firstOutputPtsUs = info.presentationTimeUs
+                if (info.presentationTimeUs <= lastOutputPtsUs) {
+                    Log.w(
+                        TAG,
+                        "PTS AAC salida no creciente: ${info.presentationTimeUs} <= $lastOutputPtsUs",
+                    )
+                }
+                lastOutputPtsUs = info.presentationTimeUs
                 val buffer = mediaCodec.getOutputBuffer(index)
                 if (buffer != null) {
                     buffer.position(info.offset)
@@ -117,21 +142,72 @@ class AacAudioEncoder(
 
         try {
             while (!stopping.get()) {
+                // Tras obtener el formato AAC ya no se encola más silencio de
+                // arranque: así no quedan frames de relleno al iniciar el audio.
+                if (!forwarding && formatReady.get()) {
+                    val pendingOutput = mediaCodec.dequeueOutputBuffer(info, OUTPUT_TIMEOUT_US)
+                    if (pendingOutput >= 0) deliverOutput(pendingOutput)
+                    continue
+                }
                 val inputIndex = mediaCodec.dequeueInputBuffer(INPUT_TIMEOUT_US)
                 if (inputIndex >= 0) {
                     val input = mediaCodec.getInputBuffer(inputIndex)
                     if (input != null) {
-                        // Un frame PCM equivale a frameNs de tiempo real. Sin este
-                        // ritmo el codificador genera PTS mucho más rápido que
-                        // la vídeo y el archivo acaba con audio muy alargado.
+                        // El PTS nace del reloj monotónico y del frame capturado,
+                        // nunca de un contador local que empieza en cero.
+                        var ptsUs = 0L
                         if (forwarding) {
-                            val now = System.nanoTime()
-                            if (nextInputNs == 0L || now - nextInputNs > 5 * frameNs) {
-                                nextInputNs = now
+                            if (!anchored) {
+                                val clock = provider.clock()
+                                if (clock != null) {
+                                    rateHz = clock.sampleRate
+                                    silenceFramesToDetect = rateHz / frameSamples * 2
+                                    // framePosition y framesQueued cuentan
+                                    // muestras por canal (1 frame PCM = 1
+                                    // muestra por canal), no bloques de 1024.
+                                    val nsPerSample = 1_000_000_000L / rateHz
+                                    anchorNs = clock.nanoTime -
+                                        (clock.framePosition - framesQueued) * nsPerSample
+                                    anchorFrame = framesQueued
+                                    if (!clockLogged) {
+                                        clockLogged = true
+                                        val message = "Audio anclado a getTimestamp: " +
+                                            "frame=${clock.framePosition} " +
+                                            "nano=${clock.nanoTime} rate=$rateHz"
+                                        Log.i(TAG, message)
+                                        CaptureDiagnostics.log(message)
+                                    }
+                                } else {
+                                    anchorNs = System.nanoTime()
+                                    anchorFrame = framesQueued
+                                    if (!clockLogged) {
+                                        clockLogged = true
+                                        val message = "Audio anclado a nanoTime (sin getTimestamp)"
+                                        Log.w(TAG, message)
+                                        CaptureDiagnostics.log(message)
+                                    }
+                                }
+                                anchored = true
                             }
-                            val waitNs = nextInputNs - now
-                            if (waitNs > 0) java.util.concurrent.locks.LockSupport.parkNanos(waitNs)
-                            nextInputNs += frameNs
+
+                            // Nota: getTimestamp() solo se consulta una vez al
+                            // anclar. En este dispositivo las consultas
+                            // posteriores pueden bloquearse; el PTS avanza con
+                            // frames acumulados y el anclaje inicial basta.
+                            // El ritmo lo marca la propia lectura PCM: el
+                            // proveedor espera como máximo un frame y devuelve
+                            // silencio si no hay datos. No se duplica el reloj
+                            // con parkNanos aquí (bloqueaba el hilo en este
+                            // dispositivo y deixaba pasar decenas de segundos
+                            // entre frames AAC).
+                            // Un frame PCM de 16 bits es una muestra por canal;
+                            // el PTS avanza 1/rateHz por muestra acumulada.
+                            val nsPerSample = 1_000_000_000L / rateHz
+                            val frameNs = anchorNs +
+                                (framesQueued - anchorFrame) * nsPerSample
+                            // PTS absoluto del mismo reloj que el vídeo; el
+                            // muxer restará el origen común a ambas pistas.
+                            ptsUs = (frameNs / 1000).coerceAtLeast(0)
                         }
 
                         // PcmSource rellena el frame completo; si la fuente no
@@ -156,7 +232,15 @@ class AacAudioEncoder(
                                 Log.i(
                                     TAG,
                                     "PCM frames=$statFrames leídas/frame=${"%.1f".format(avgRead)} " +
+                                        "canales=${spec.channelCount} rate=$rateHz " +
                                         "no_cero=${"%.1f".format(nonZeroPct)}% " +
+                                        "RMS=${"%.1f".format(rms)} pico=$statMax " +
+                                        "PTS=${"%.3f".format(ptsUs / 1_000_000.0)}s",
+                                )
+                                CaptureDiagnostics.log(
+                                    "PCM codificado: muestras=$statSamples leídas=$statReadSamples " +
+                                        "frames=$statFrames canales=${spec.channelCount} " +
+                                        "rate=$rateHz no_cero=${"%.1f".format(nonZeroPct)}% " +
                                         "RMS=${"%.1f".format(rms)} pico=$statMax " +
                                         "PTS=${"%.3f".format(ptsUs / 1_000_000.0)}s",
                                 )
@@ -178,18 +262,31 @@ class AacAudioEncoder(
                             if (silentFrames >= silenceFramesToDetect) {
                                 silenceReported = true
                                 Log.w(TAG, "La fuente de audio seleccionada no entrega señal")
+                                CaptureDiagnostics.log(
+                                    "Encoder: $silentFrames frames consecutivos sin señal (PTS=${"%.2f".format(ptsUs / 1_000_000.0)}s)",
+                                )
                                 onSilent()
                             }
                         }
                         input.clear()
                         val shortBuffer = input.asShortBuffer()
-                        val count = min(pcm.size, shortBuffer.remaining())
+                        val capacity = shortBuffer.remaining()
+                        if (!capacityLogged) {
+                            capacityLogged = true
+                            val message = "AAC buffer de entrada=$capacity muestras, frame=${pcm.size}"
+                            Log.i(TAG, message)
+                            CaptureDiagnostics.log(message)
+                        }
+                        val count = min(pcm.size, capacity)
                         if (count > 0) {
                             shortBuffer.put(pcm, 0, count)
                             mediaCodec.queueInputBuffer(inputIndex, 0, count * 2, ptsUs, 0)
-                        }
-                        if (forwarding) {
-                            ptsUs += frameSamples * 1_000_000L / spec.sampleRate
+                            if (forwarding) {
+                                if (firstInputPtsUs < 0) firstInputPtsUs = ptsUs
+                                lastInputPtsUs = ptsUs
+                                lastQueuedPtsUs = ptsUs
+                                framesQueued += (count / spec.channelCount).toLong()
+                            }
                         }
                     }
                 }
@@ -200,6 +297,7 @@ class AacAudioEncoder(
                             EncoderOutput.TRACK_AUDIO,
                             mediaCodec.outputFormat,
                         )
+                        formatReady.set(true)
                         formatLatch.countDown()
                     }
                     MediaCodec.INFO_TRY_AGAIN_LATER,
@@ -217,7 +315,7 @@ class AacAudioEncoder(
                         index,
                         0,
                         0,
-                        ptsUs,
+                        lastQueuedPtsUs,
                         MediaCodec.BUFFER_FLAG_END_OF_STREAM,
                     )
                     eosQueued = true
@@ -235,8 +333,14 @@ class AacAudioEncoder(
                 }
             }
             if (!eosReceived) Log.w(TAG, "No se recibió el EOS del codificador AAC")
+            val summary = "AAC resumen: rate=$rateHz frames=$framesQueued " +
+                "PTS entrada $firstInputPtsUs..$lastInputPtsUs us, " +
+                "PTS salida $firstOutputPtsUs..$lastOutputPtsUs us"
+            Log.i(TAG, summary)
+            CaptureDiagnostics.log(summary)
         } catch (e: Exception) {
             Log.e(TAG, "Error en el hilo del encoder AAC", e)
+            CaptureDiagnostics.log("Encoder AAC: error ${e.javaClass.simpleName}: ${e.message}")
         } finally {
             try {
                 mediaCodec.stop()

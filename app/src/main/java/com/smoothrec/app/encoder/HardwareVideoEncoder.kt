@@ -99,13 +99,17 @@ class HardwareVideoEncoder(private val codecName: String) : VideoEncoder {
     override fun inputSurface(): Surface =
         surface ?: throw IllegalStateException("El encoder todavía no está iniciado")
 
-    override fun stop() {
+    override fun signalEndOfStream() {
         val mediaCodec = codec ?: return
         try {
             mediaCodec.signalEndOfInputStream()
         } catch (e: IllegalStateException) {
             Log.w(TAG, "No se pudo señalar fin de stream", e)
         }
+    }
+
+    override fun stop() {
+        if (codec == null) return
         try {
             eosLatch.await(5, TimeUnit.SECONDS)
         } catch (e: InterruptedException) {
