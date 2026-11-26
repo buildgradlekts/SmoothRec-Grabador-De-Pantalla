@@ -79,6 +79,8 @@ El asistente visual se muestra únicamente la primera vez, o cuando se abre expl
 | Almacenamiento | `Movies/SmoothRec` vía MediaStore |
 | Por defecto | Pantalla · 60 FPS · audio interno |
 
+También están disponibles los perfiles de bitrate **AUTO / Bajo / Medio / Alto / Ultra / Máximo**, el límite de duración **Ilimitado / 5 / 15 / 30 / 60 min** y la **pausa/reanudación** desde la interfaz, la notificación y la barra flotante.
+
 `CaptureSizeResolver` consulta `VideoCapabilities` para validar tamaño, alineación y tasa. Si la combinación elegida no es compatible, prueba la misma tasa con menor resolución y después 30 FPS, avisa al usuario y refleja los valores aplicados en la notificación. Nunca se estira, recorta ni gira la imagen.
 
 En el Redmi Note 13 4G (1080×2400), Pantalla y 1080P convergen en **864×1920** y 720P produce **720×1600**. En pantallas 1080×2160, 1080P produce **960×1920** y 720P **720×1440**.
@@ -135,14 +137,15 @@ APK generado: `app/build/outputs/apk/debug/app-debug.apk`
 
 ## Pendiente
 
-- Selección manual de bitrate.
-- Control de duración, pausa/reanudación y grabaciones en segundo plano extendido.
+- Control numérico libre de bitrate en kbps (por ahora se seleccionan perfiles: AUTO / Bajo / Medio / Alto / Ultra / Máximo).
+- Validación en dispositivo de grabaciones largas en segundo plano con las políticas de batería del fabricante, especialmente Samsung Galaxy A17 / One UI.
 - Interfaz editable para cambiar la URL del servidor OTA (el backend ya admite `setReleasesUrl`).
+- Pruebas reales de OTA, audio mixto y estabilidad a 60 FPS; este entorno no tiene teléfono ni `adb`.
 
 ## Acerca de SmoothRec
 
 - Creador y responsable del proyecto: **Keiner**.
 - Asistencia de desarrollo e inteligencia artificial: **ChatGPT (OpenAI)**.
-- Implementación y colaboración técnica: **OpenClaude**.
+- Implementación y colaboración técnica: **OpenClaude y OpenCode**.
 - TikTok: https://www.tiktok.com/@keinerxzv
-- Instagram: enlace pendiente para una futura actualización.
+- Instagram: https://www.instagram.com/keinerxzv_/
